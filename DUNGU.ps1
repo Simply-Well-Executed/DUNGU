@@ -14,6 +14,11 @@ param(
     [ValidateRange(0, 100)]
     [int]$ReplayPasses = 0,
 
+    [switch]$EnablePipe,
+
+    [ValidateRange(1, 64)]
+    [int]$PipeQueuePackets = 1,
+
     [switch]$CompileOnly,
 
     [switch]$SelfTest
@@ -21,11 +26,16 @@ param(
 
 $serverCode = @'
 using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.IO;
 using System.IO.Compression;
+using System.IO.Pipes;
+using Microsoft.Win32.SafeHandles;
 using System.Numerics;
 using System.Runtime.InteropServices;
+using System.Security.Principal;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -159,12 +169,43 @@ namespace Dungu.ProcessLoopback
         internal const int WaveFormatIeeeFloat = 3;
         internal const int WaveFormatExtensible = 0xFFFE;
         internal const int AudioClientStreamFlagsLoopback = 0x00020000;
+        internal const int AudioClientStreamFlagsAutoConvertPcm = unchecked((int)0x80000000u);
         internal const int AudioClientBufferFlagSilent = 0x00000002;
 
         internal static readonly Guid PcmSubFormat = new Guid("00000001-0000-0010-8000-00AA00389B71");
         internal static readonly Guid IeeeFloatSubFormat = new Guid("00000003-0000-0010-8000-00AA00389B71");
         internal static readonly Guid AudioClientInterfaceId = new Guid("1CB9AD4C-DBFA-4C32-B178-C2F568A703B2");
         internal static readonly Guid AudioCaptureClientInterfaceId = new Guid("C8ADBD64-E71E-48A0-A4DE-185C395CD317");
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SecurityAttributes
+        {
+            public int Length;
+            public IntPtr SecurityDescriptor;
+            public int InheritHandle;
+        }
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, EntryPoint = "ConvertStringSecurityDescriptorToSecurityDescriptorW", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool ConvertStringSecurityDescriptorToSecurityDescriptor(
+            string securityDescriptor,
+            uint revision,
+            out IntPtr convertedDescriptor,
+            out uint descriptorSize);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "CreateNamedPipeW", SetLastError = true)]
+        private static extern SafePipeHandle CreateNamedPipe(
+            string pipeName,
+            uint openMode,
+            uint pipeMode,
+            uint maxInstances,
+            uint outputBufferSize,
+            uint inputBufferSize,
+            uint defaultTimeout,
+            ref SecurityAttributes securityAttributes);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr LocalFree(IntPtr memory);
 
         [DllImport("Mmdevapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true, PreserveSig = true)]
         internal static extern int ActivateAudioInterfaceAsync(
@@ -173,6 +214,66 @@ namespace Dungu.ProcessLoopback
             IntPtr activationParams,
             [MarshalAs(UnmanagedType.Interface)] IActivateAudioInterfaceCompletionHandler completionHandler,
             out IActivateAudioInterfaceAsyncOperation activationOperation);
+
+        internal static NamedPipeServerStream CreateLocalCurrentUserPipe(string pipeName)
+        {
+            using (WindowsIdentity identity = WindowsIdentity.GetCurrent())
+            {
+                SecurityIdentifier userSid = identity.User;
+                if (userSid == null)
+                    throw new InvalidOperationException("The current Windows identity has no user SID.");
+
+                string securityDescriptor = "D:P(A;;GA;;;" + userSid.Value + ")(A;;GA;;;SY)";
+                IntPtr nativeDescriptor = IntPtr.Zero;
+                SafePipeHandle pipeHandle = null;
+                try
+                {
+                    uint descriptorSize;
+                    if (!ConvertStringSecurityDescriptorToSecurityDescriptor(
+                        securityDescriptor,
+                        1,
+                        out nativeDescriptor,
+                        out descriptorSize))
+                    {
+                        throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not create the named-pipe access descriptor.");
+                    }
+
+                    var attributes = new SecurityAttributes
+                    {
+                        Length = Marshal.SizeOf(typeof(SecurityAttributes)),
+                        SecurityDescriptor = nativeDescriptor,
+                        InheritHandle = 0
+                    };
+
+                    const uint PipeAccessOutbound = 0x00000002;
+                    const uint FileFlagOverlapped = 0x40000000;
+                    const uint PipeWait = 0x00000000;
+                    const uint PipeRejectRemoteClients = 0x00000008;
+                    pipeHandle = CreateNamedPipe(
+                        @"\\.\pipe\" + pipeName,
+                        PipeAccessOutbound | FileFlagOverlapped,
+                        PipeWait | PipeRejectRemoteClients,
+                        1,
+                        0,
+                        0,
+                        0,
+                        ref attributes);
+                    if (pipeHandle == null || pipeHandle.IsInvalid)
+                        throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not create the local named pipe.");
+
+                    var stream = new NamedPipeServerStream(PipeDirection.Out, true, false, pipeHandle);
+                    pipeHandle = null;
+                    return stream;
+                }
+                finally
+                {
+                    if (nativeDescriptor != IntPtr.Zero)
+                        LocalFree(nativeDescriptor);
+                    if (pipeHandle != null)
+                        pipeHandle.Dispose();
+                }
+            }
+        }
 
         internal static int PropVariantSize
         {
@@ -336,6 +437,19 @@ namespace Dungu.ProcessLoopback
             int sampleRate = 48000)
         {
             return new AudioSampleFormat(encoding, channels, containerBits, validBits, blockAlign, sampleRate);
+        }
+
+        internal static AudioSampleFormat CreateProcessLoopbackCaptureFormat()
+        {
+            // The process-loopback virtual client can return E_NOTIMPL from GetMixFormat.
+            // Use the explicit PCM format used by Microsoft's ApplicationLoopback sample.
+            return new AudioSampleFormat(
+                NativeMethods.WaveFormatPcm,
+                2,
+                16,
+                16,
+                4,
+                44100);
         }
 
         internal void ConvertToFloat(IntPtr data, int frames, float[] destination, int destinationOffset)
@@ -536,6 +650,310 @@ namespace Dungu.ProcessLoopback
         public byte ValidBitsPerSample;
         public byte StorageMode;
         public byte CompandingApplied;
+    }
+
+    public static class AudioPipeProtocol
+    {
+        public const int HeaderSize = 64;
+        public const ushort Version = 1;
+
+        public static void ValidatePayload(AudioTimelineEntry entry, int payloadLength)
+        {
+            int expectedLength = checked(entry.FrameCount * entry.BlockAlign);
+            if (entry.ProcessId <= 0 || entry.SampleRate <= 0 || entry.Channels == 0
+                || entry.BlockAlign == 0 || entry.FrameCount <= 0)
+                throw new ArgumentException("The pipe timeline metadata is incomplete.", "entry");
+            if (payloadLength != expectedLength)
+                throw new ArgumentException("The pipe payload must contain the complete uncompressed audio packet.", "payloadLength");
+        }
+
+        public static byte[] CreateHeader(AudioTimelineEntry entry, int payloadLength)
+        {
+            ValidatePayload(entry, payloadLength);
+
+            var header = new byte[HeaderSize];
+            header[0] = (byte)'D';
+            header[1] = (byte)'N';
+            header[2] = (byte)'G';
+            header[3] = (byte)'U';
+            BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(4, 2), Version);
+            BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(6, 2), HeaderSize);
+            BinaryPrimitives.WriteInt64LittleEndian(header.AsSpan(8, 8), entry.Sequence);
+            BinaryPrimitives.WriteInt64LittleEndian(header.AsSpan(16, 8), entry.QpcPosition);
+            BinaryPrimitives.WriteInt64LittleEndian(header.AsSpan(24, 8), entry.DevicePosition);
+            BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(32, 4), unchecked((uint)entry.ProcessId));
+            BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(36, 4), unchecked((uint)entry.SampleRate));
+            BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(40, 2), entry.Channels);
+            BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(42, 2), entry.FormatTag);
+            BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(44, 2), entry.BitsPerSample);
+            BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(46, 2), entry.ValidBitsPerSample);
+            BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(48, 2), entry.BlockAlign);
+            header[50] = (byte)AudioStorageMode.Raw;
+            header[51] = 0; // The pipe carries the original, uncompanded samples.
+            BinaryPrimitives.WriteInt32LittleEndian(header.AsSpan(52, 4), entry.FrameCount);
+            BinaryPrimitives.WriteInt32LittleEndian(header.AsSpan(56, 4), payloadLength);
+            BinaryPrimitives.WriteInt32LittleEndian(header.AsSpan(60, 4), entry.Flags);
+            return header;
+        }
+    }
+
+    internal sealed class AudioPipePacket
+    {
+        internal readonly AudioTimelineEntry Timeline;
+        internal readonly byte[] Payload;
+
+        internal AudioPipePacket(AudioTimelineEntry timeline, byte[] payload)
+        {
+            Timeline = timeline;
+            Payload = payload;
+        }
+    }
+
+    internal sealed class BoundedAudioPipeQueue
+    {
+        private readonly object _gate = new object();
+        private readonly Queue<AudioPipePacket> _items = new Queue<AudioPipePacket>();
+        private readonly int _capacity;
+
+        internal BoundedAudioPipeQueue(int capacity)
+        {
+            if (capacity <= 0)
+                throw new ArgumentOutOfRangeException("capacity");
+            _capacity = capacity;
+        }
+
+        internal bool EnqueueDroppingOldest(AudioPipePacket packet)
+        {
+            if (packet == null)
+                throw new ArgumentNullException("packet");
+
+            lock (_gate)
+            {
+                bool droppedOldest = _items.Count >= _capacity;
+                if (droppedOldest)
+                    _items.Dequeue();
+                _items.Enqueue(packet);
+                return droppedOldest;
+            }
+        }
+
+        internal bool TryDequeue(out AudioPipePacket packet)
+        {
+            lock (_gate)
+            {
+                if (_items.Count == 0)
+                {
+                    packet = null;
+                    return false;
+                }
+                packet = _items.Dequeue();
+                return true;
+            }
+        }
+
+        internal int Clear()
+        {
+            lock (_gate)
+            {
+                int count = _items.Count;
+                _items.Clear();
+                return count;
+            }
+        }
+    }
+
+    public sealed class NamedPipeAudioBroadcaster : IDisposable
+    {
+        private const int ConnectionSetupTimeoutSeconds = 5;
+        private readonly BoundedAudioPipeQueue _queue;
+        private readonly AutoResetEvent _packetAvailable = new AutoResetEvent(false);
+        private readonly CancellationTokenSource _stop = new CancellationTokenSource();
+        private readonly TaskCompletionSource<bool> _ready =
+            new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        private Thread _worker;
+        private NamedPipeServerStream _activePipe;
+        private Exception _lastError;
+        private int _started;
+        private int _disposed;
+        private int _connected;
+        private long _droppedPackets;
+        private long _unconnectedPackets;
+        private long _transmittedPackets;
+        private long _transmittedBytes;
+        private long _clientDisconnects;
+
+        public string PipeName { get; private set; }
+        public string PipePath { get { return @"\\.\pipe\" + PipeName; } }
+        public bool IsClientConnected { get { return Volatile.Read(ref _connected) != 0; } }
+        public long DroppedPackets { get { return Interlocked.Read(ref _droppedPackets); } }
+        public long UnconnectedPackets { get { return Interlocked.Read(ref _unconnectedPackets); } }
+        public long TransmittedPackets { get { return Interlocked.Read(ref _transmittedPackets); } }
+        public long TransmittedBytes { get { return Interlocked.Read(ref _transmittedBytes); } }
+        public long ClientDisconnects { get { return Interlocked.Read(ref _clientDisconnects); } }
+        public string LastError
+        {
+            get
+            {
+                Exception error = Volatile.Read(ref _lastError);
+                return error == null ? null : error.GetType().Name + ": " + error.Message;
+            }
+        }
+
+        public NamedPipeAudioBroadcaster(string pipeName, int queueCapacity)
+        {
+            if (String.IsNullOrWhiteSpace(pipeName))
+                throw new ArgumentException("A pipe name is required.", "pipeName");
+            if (pipeName.IndexOfAny(new char[] { '\\', '/' }) >= 0)
+                throw new ArgumentException("Use a pipe name, not a path.", "pipeName");
+            if (queueCapacity <= 0)
+                throw new ArgumentOutOfRangeException("queueCapacity");
+
+            PipeName = pipeName;
+            _queue = new BoundedAudioPipeQueue(queueCapacity);
+        }
+
+        public void Start()
+        {
+            if (Interlocked.CompareExchange(ref _started, 1, 0) != 0)
+                throw new InvalidOperationException("The named-pipe broadcaster can only be started once.");
+            if (Volatile.Read(ref _disposed) != 0)
+                throw new ObjectDisposedException("NamedPipeAudioBroadcaster");
+
+            _worker = new Thread(WorkerMain)
+            {
+                IsBackground = true,
+                Name = "DUNGU pipe " + PipeName,
+                Priority = ThreadPriority.AboveNormal
+            };
+            _worker.SetApartmentState(ApartmentState.MTA);
+            _worker.Start();
+
+            Task ready = Task.WhenAny(
+                _ready.Task,
+                Task.Delay(TimeSpan.FromSeconds(ConnectionSetupTimeoutSeconds))).GetAwaiter().GetResult();
+            if (!Object.ReferenceEquals(ready, _ready.Task))
+            {
+                Dispose();
+                throw new TimeoutException("Timed out while creating the local audio pipe.");
+            }
+            _ready.Task.GetAwaiter().GetResult();
+        }
+
+        public bool TryPublish(byte[] rawAudio, AudioTimelineEntry timeline)
+        {
+            if (rawAudio == null)
+                throw new ArgumentNullException("rawAudio");
+            if (rawAudio.Length == 0)
+                throw new ArgumentException("Audio pipe packets cannot be empty.", "rawAudio");
+            AudioPipeProtocol.ValidatePayload(timeline, rawAudio.Length);
+
+            if (Volatile.Read(ref _disposed) != 0)
+                return false;
+            if (!IsClientConnected)
+            {
+                Interlocked.Increment(ref _unconnectedPackets);
+                return false;
+            }
+
+            var packet = new AudioPipePacket(timeline, rawAudio);
+            if (_queue.EnqueueDroppingOldest(packet))
+                Interlocked.Increment(ref _droppedPackets);
+            _packetAvailable.Set();
+            return true;
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+                return;
+
+            _stop.Cancel();
+            _packetAvailable.Set();
+            NamedPipeServerStream active = Interlocked.Exchange(ref _activePipe, null);
+            if (active != null)
+                active.Dispose();
+
+            if (_worker != null && _worker != Thread.CurrentThread && !_worker.Join(5000))
+                throw new TimeoutException("The named-pipe worker did not stop within five seconds.");
+
+            _packetAvailable.Dispose();
+            _stop.Dispose();
+        }
+
+        private void WorkerMain()
+        {
+            while (!_stop.IsCancellationRequested)
+            {
+                NamedPipeServerStream pipe = null;
+                try
+                {
+                    pipe = NativeMethods.CreateLocalCurrentUserPipe(PipeName);
+                    Interlocked.Exchange(ref _activePipe, pipe);
+                    _ready.TrySetResult(true);
+                    pipe.WaitForConnectionAsync(_stop.Token).GetAwaiter().GetResult();
+                    if (_stop.IsCancellationRequested)
+                        break;
+
+                    Volatile.Write(ref _connected, 1);
+                    while (pipe.IsConnected && !_stop.IsCancellationRequested)
+                    {
+                        AudioPipePacket packet;
+                        if (!_queue.TryDequeue(out packet))
+                        {
+                            _packetAvailable.WaitOne(100);
+                            continue;
+                        }
+
+                        byte[] header = AudioPipeProtocol.CreateHeader(packet.Timeline, packet.Payload.Length);
+                        try
+                        {
+                            pipe.WriteAsync(header, 0, header.Length, _stop.Token).GetAwaiter().GetResult();
+                            pipe.WriteAsync(packet.Payload, 0, packet.Payload.Length, _stop.Token).GetAwaiter().GetResult();
+                        }
+                        catch (IOException) when (!_stop.IsCancellationRequested)
+                        {
+                            Interlocked.Increment(ref _droppedPackets);
+                            throw;
+                        }
+                        Interlocked.Increment(ref _transmittedPackets);
+                        Interlocked.Add(ref _transmittedBytes, packet.Payload.Length);
+                    }
+                }
+                catch (OperationCanceledException) when (_stop.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (IOException) when (!_stop.IsCancellationRequested)
+                {
+                    Interlocked.Increment(ref _clientDisconnects);
+                    ClearPendingPackets();
+                }
+                catch (Exception error)
+                {
+                    if (!_stop.IsCancellationRequested)
+                    {
+                        Interlocked.CompareExchange(ref _lastError, error, null);
+                        _ready.TrySetException(error);
+                    }
+                    break;
+                }
+                finally
+                {
+                    Volatile.Write(ref _connected, 0);
+                    Interlocked.CompareExchange(ref _activePipe, null, pipe);
+                    if (pipe != null)
+                        pipe.Dispose();
+                    ClearPendingPackets();
+                }
+            }
+        }
+
+        private void ClearPendingPackets()
+        {
+            int discardedCount = _queue.Clear();
+            if (discardedCount > 0)
+                Interlocked.Add(ref _droppedPackets, discardedCount);
+        }
     }
 
     public sealed class AudioTimelineRingBuffer
@@ -1030,6 +1448,12 @@ namespace Dungu.ProcessLoopback
 
         private static float MeasureBlock(byte[] payload, AudioTimelineEntry entry)
         {
+            // For a silent WASAPI packet, the sample bytes are undefined. Capture stores
+            // zeroed bytes for bounded memory handling; honor the flag instead of decoding
+            // those bytes as PCM (notably, zero is full-scale negative for unsigned PCM8).
+            if ((entry.Flags & NativeMethods.AudioClientBufferFlagSilent) != 0)
+                return 0;
+
             AudioStorageMode mode = (AudioStorageMode)entry.StorageMode;
             if (mode == AudioStorageMode.Raw)
                 return AudioSampleFormat.FromTimeline(entry).MeasurePeak(payload, 0, entry.FrameCount);
@@ -1072,6 +1496,7 @@ namespace Dungu.ProcessLoopback
 
         private readonly bool _includeProcessTree;
         private readonly AudioTimelineRingBuffer _ring;
+        private readonly NamedPipeAudioBroadcaster _pipe;
         private readonly AudioBlockEncoder _encoder = new AudioBlockEncoder();
         private readonly ManualResetEventSlim _stopRequested = new ManualResetEventSlim(false);
         private readonly TaskCompletionSource<bool> _startup =
@@ -1084,16 +1509,26 @@ namespace Dungu.ProcessLoopback
         private int _disposed;
         private int _running;
         private int _peakBits;
+        private long _pipeSequence;
 
         public uint ProcessId { get; private set; }
         public string ProcessName { get; private set; }
         public bool IsRunning { get { return Volatile.Read(ref _running) != 0; } }
+        public string PipePath { get { return _pipe == null ? null : _pipe.PipePath; } }
+        public bool IsPipeClientConnected { get { return _pipe != null && _pipe.IsClientConnected; } }
+        public long PipeDroppedPackets { get { return _pipe == null ? 0 : _pipe.DroppedPackets; } }
+        public long PipeUnconnectedPackets { get { return _pipe == null ? 0 : _pipe.UnconnectedPackets; } }
+        public long PipeTransmittedPackets { get { return _pipe == null ? 0 : _pipe.TransmittedPackets; } }
+        public long PipeTransmittedBytes { get { return _pipe == null ? 0 : _pipe.TransmittedBytes; } }
+        public long PipeClientDisconnects { get { return _pipe == null ? 0 : _pipe.ClientDisconnects; } }
         public string LastError
         {
             get
             {
                 Exception error = Volatile.Read(ref _lastError);
-                return error == null ? null : error.GetType().Name + ": " + error.Message;
+                if (error != null)
+                    return error.GetType().Name + ": " + error.Message;
+                return _pipe == null ? null : _pipe.LastError;
             }
         }
 
@@ -1101,7 +1536,9 @@ namespace Dungu.ProcessLoopback
             uint targetProcessId,
             string processName,
             bool includeProcessTree,
-            AudioTimelineRingBuffer ring)
+            AudioTimelineRingBuffer ring,
+            bool enablePipe,
+            int pipeQueuePackets)
         {
             if (targetProcessId == 0)
                 throw new ArgumentOutOfRangeException("targetProcessId");
@@ -1114,6 +1551,8 @@ namespace Dungu.ProcessLoopback
             ProcessName = processName;
             _includeProcessTree = includeProcessTree;
             _ring = ring;
+            if (enablePipe)
+                _pipe = new NamedPipeAudioBroadcaster("DunguAudioPipe_" + targetProcessId, pipeQueuePackets);
         }
 
         public void Start()
@@ -1165,16 +1604,26 @@ namespace Dungu.ProcessLoopback
             {
                 audioClient = ActivateAudioClient();
 
-                IntPtr formatPointer = IntPtr.Zero;
-                int formatResult = audioClient.GetMixFormat(out formatPointer);
+                sampleFormat = AudioSampleFormat.CreateProcessLoopbackCaptureFormat();
+                WaveFormatEx captureFormat = new WaveFormatEx
+                {
+                    FormatTag = (ushort)NativeMethods.WaveFormatPcm,
+                    Channels = 2,
+                    SamplesPerSecond = 44100,
+                    AverageBytesPerSecond = 44100 * 4,
+                    BlockAlign = 4,
+                    BitsPerSample = 16,
+                    ExtraSize = 0
+                };
+                IntPtr formatPointer = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(WaveFormatEx)));
                 try
                 {
-                    NativeMethods.ThrowIfFailed(formatResult, "IAudioClient.GetMixFormat");
-                    sampleFormat = AudioSampleFormat.FromNative(formatPointer);
+                    Marshal.StructureToPtr(captureFormat, formatPointer, false);
                     NativeMethods.ThrowIfFailed(
                         audioClient.Initialize(
                             SharedMode,
-                            NativeMethods.AudioClientStreamFlagsLoopback,
+                            NativeMethods.AudioClientStreamFlagsLoopback
+                                | NativeMethods.AudioClientStreamFlagsAutoConvertPcm,
                             BufferDurationHns,
                             0,
                             formatPointer,
@@ -1183,8 +1632,7 @@ namespace Dungu.ProcessLoopback
                 }
                 finally
                 {
-                    if (formatPointer != IntPtr.Zero)
-                        Marshal.FreeCoTaskMem(formatPointer);
+                    Marshal.FreeHGlobal(formatPointer);
                 }
 
                 object captureObject;
@@ -1195,6 +1643,9 @@ namespace Dungu.ProcessLoopback
                 captureClient = captureObject as IAudioCaptureClient;
                 if (captureClient == null)
                     throw new InvalidCastException("IAudioClient.GetService did not return IAudioCaptureClient.");
+
+                if (_pipe != null)
+                    _pipe.Start();
 
                 NativeMethods.ThrowIfFailed(audioClient.Start(), "IAudioClient.Start");
                 started = true;
@@ -1228,6 +1679,17 @@ namespace Dungu.ProcessLoopback
 
                 ReleaseComObject(captureClient);
                 ReleaseComObject(audioClient);
+                if (_pipe != null)
+                {
+                    try
+                    {
+                        _pipe.Dispose();
+                    }
+                    catch (Exception error)
+                    {
+                        RecordError(error);
+                    }
+                }
             }
         }
 
@@ -1276,9 +1738,9 @@ namespace Dungu.ProcessLoopback
                         NativeMethods.ThrowIfFailed(captureClient.ReleaseBuffer(frames), "IAudioCaptureClient.ReleaseBuffer");
                     }
 
-                    EncodedAudioBlock encoded = _encoder.Encode(rawBytes, originalByteLength, _normalizedScratch, sampleCount);
                     AudioTimelineEntry timeline = new AudioTimelineEntry
                     {
+                        Sequence = Interlocked.Increment(ref _pipeSequence) - 1,
                         QpcPosition = qpcPosition,
                         DevicePosition = devicePosition,
                         ProcessId = checked((int)ProcessId),
@@ -1290,10 +1752,14 @@ namespace Dungu.ProcessLoopback
                         BlockAlign = checked((ushort)sampleFormat.BlockAlign),
                         FormatTag = checked((ushort)sampleFormat.Encoding),
                         BitsPerSample = checked((byte)sampleFormat.ContainerBits),
-                        ValidBitsPerSample = checked((byte)sampleFormat.ValidBits),
-                        StorageMode = (byte)encoded.StorageMode,
-                        CompandingApplied = encoded.CompandingApplied ? (byte)1 : (byte)0
+                        ValidBitsPerSample = checked((byte)sampleFormat.ValidBits)
                     };
+                    if (_pipe != null)
+                        _pipe.TryPublish(rawBytes, timeline);
+
+                    EncodedAudioBlock encoded = _encoder.Encode(rawBytes, originalByteLength, _normalizedScratch, sampleCount);
+                    timeline.StorageMode = (byte)encoded.StorageMode;
+                    timeline.CompandingApplied = encoded.CompandingApplied ? (byte)1 : (byte)0;
                     _ring.Append(encoded.Payload, encoded.Payload.Length, timeline);
                     PublishPeak(peak);
                     NativeMethods.ThrowIfFailed(
@@ -1448,6 +1914,10 @@ namespace Dungu.ProcessLoopback
             VerifyTimelineReplay();
             VerifyCompressedTimelineReplay();
             passed.Add("compressed timeline wraparound and repeatable signal passes");
+            VerifyBoundedPipeQueue();
+            passed.Add("nonblocking bounded pipe queue drops oldest stale packets");
+            VerifyNamedPipeStreaming();
+            passed.Add("same-user named-pipe connection and framed raw-audio delivery");
             return passed.ToArray();
         }
 
@@ -1777,6 +2247,115 @@ namespace Dungu.ProcessLoopback
                 throw new InvalidOperationException("ZLIB/companded replay did not reconstruct the same audio on repeated passes.");
         }
 
+        private static void VerifyNamedPipeStreaming()
+        {
+            string pipeName = "DunguAudioPipe_Test_" + Guid.NewGuid().ToString("N");
+            byte[] sourceBytes = new byte[]
+            {
+                0x00, 0x10, 0x00, 0xF0,
+                0x00, 0x08, 0x00, 0xF8,
+                0x00, 0x18, 0x00, 0xE8
+            };
+            var entry = new AudioTimelineEntry
+            {
+                Sequence = 9,
+                QpcPosition = 123456789,
+                DevicePosition = 48000,
+                ProcessId = 42,
+                FrameCount = 3,
+                Flags = 0,
+                SampleRate = 48000,
+                Channels = 2,
+                BlockAlign = 4,
+                FormatTag = NativeMethods.WaveFormatPcm,
+                BitsPerSample = 16,
+                ValidBitsPerSample = 16
+            };
+
+            using (var broadcaster = new NamedPipeAudioBroadcaster(pipeName, 2))
+            using (var client = new NamedPipeClientStream(".", pipeName, PipeDirection.In, PipeOptions.Asynchronous))
+            {
+                broadcaster.Start();
+                if (broadcaster.TryPublish(sourceBytes, entry) || broadcaster.UnconnectedPackets != 1)
+                    throw new InvalidOperationException("The pipe retained audio before a receiver connected.");
+                client.Connect(3000);
+
+                DateTime deadline = DateTime.UtcNow.AddSeconds(3);
+                while (!broadcaster.IsClientConnected && DateTime.UtcNow < deadline)
+                    Thread.Sleep(1);
+                if (!broadcaster.IsClientConnected)
+                    throw new InvalidOperationException("The named-pipe server did not observe the local client connection.");
+                if (!broadcaster.TryPublish(sourceBytes, entry))
+                    throw new InvalidOperationException("The named-pipe server rejected a packet for its connected client.");
+
+                byte[] header = new byte[AudioPipeProtocol.HeaderSize];
+                ReadExactly(client, header);
+                if (header[0] != (byte)'D' || header[1] != (byte)'N'
+                    || header[2] != (byte)'G' || header[3] != (byte)'U')
+                    throw new InvalidOperationException("The named-pipe frame has an invalid DUNGU magic value.");
+                if (BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(4, 2)) != AudioPipeProtocol.Version
+                    || BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(6, 2)) != AudioPipeProtocol.HeaderSize)
+                    throw new InvalidOperationException("The named-pipe frame version or header length is invalid.");
+                if (BinaryPrimitives.ReadInt64LittleEndian(header.AsSpan(8, 8)) != entry.Sequence
+                    || BinaryPrimitives.ReadInt64LittleEndian(header.AsSpan(16, 8)) != entry.QpcPosition
+                    || BinaryPrimitives.ReadInt64LittleEndian(header.AsSpan(24, 8)) != entry.DevicePosition)
+                    throw new InvalidOperationException("The named-pipe frame lost its sequence or timeline positions.");
+                if (BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(32, 4)) != (uint)entry.ProcessId
+                    || BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(52, 4)) != entry.FrameCount
+                    || BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(56, 4)) != sourceBytes.Length)
+                    throw new InvalidOperationException("The named-pipe frame lost its source metadata.");
+                if (BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(36, 4)) != (uint)entry.SampleRate
+                    || BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(40, 2)) != entry.Channels
+                    || BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(42, 2)) != entry.FormatTag
+                    || BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(44, 2)) != entry.BitsPerSample
+                    || BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(46, 2)) != entry.ValidBitsPerSample
+                    || BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(48, 2)) != entry.BlockAlign)
+                    throw new InvalidOperationException("The named-pipe frame lost its audio-format metadata.");
+                if (header[50] != (byte)AudioStorageMode.Raw || header[51] != 0)
+                    throw new InvalidOperationException("The live named-pipe payload must be original, uncompanded audio.");
+
+                byte[] received = new byte[sourceBytes.Length];
+                ReadExactly(client, received);
+                for (int index = 0; index < sourceBytes.Length; index++)
+                {
+                    if (received[index] != sourceBytes[index])
+                        throw new InvalidOperationException("The named-pipe transport changed audio bytes.");
+                }
+
+                if (broadcaster.TransmittedPackets != 1 || broadcaster.TransmittedBytes != sourceBytes.Length)
+                    throw new InvalidOperationException("The named-pipe transport did not account for its packet.");
+            }
+        }
+
+        private static void VerifyBoundedPipeQueue()
+        {
+            var queue = new BoundedAudioPipeQueue(2);
+            queue.EnqueueDroppingOldest(new AudioPipePacket(new AudioTimelineEntry { Sequence = 1 }, new byte[] { 1 }));
+            queue.EnqueueDroppingOldest(new AudioPipePacket(new AudioTimelineEntry { Sequence = 2 }, new byte[] { 2 }));
+            if (!queue.EnqueueDroppingOldest(new AudioPipePacket(new AudioTimelineEntry { Sequence = 3 }, new byte[] { 3 })))
+                throw new InvalidOperationException("The bounded pipe queue did not report an eviction.");
+
+            AudioPipePacket first;
+            AudioPipePacket second;
+            if (!queue.TryDequeue(out first) || !queue.TryDequeue(out second)
+                || first.Timeline.Sequence != 2 || second.Timeline.Sequence != 3)
+                throw new InvalidOperationException("The bounded pipe queue did not drop the oldest queued packet.");
+            if (queue.TryDequeue(out first))
+                throw new InvalidOperationException("The bounded pipe queue exceeded its configured capacity.");
+        }
+
+        private static void ReadExactly(Stream input, byte[] buffer)
+        {
+            int offset = 0;
+            while (offset < buffer.Length)
+            {
+                int read = input.Read(buffer, offset, buffer.Length - offset);
+                if (read == 0)
+                    throw new EndOfStreamException("The named-pipe client disconnected before a full frame was received.");
+                offset += read;
+            }
+        }
+
         private static void AssertGuid(Type type, string expected)
         {
             if (type.GUID != new Guid(expected))
@@ -1812,7 +2391,7 @@ if ($SelfTest) {
     foreach ($check in [Dungu.ProcessLoopback.NativeProcessLoopbackDiagnostics]::RunSelfTests()) {
         Write-Output "PASS $check"
     }
-    Write-Output 'All offline process-loopback self-tests passed. No capture was started.'
+    Write-Output 'All offline tests passed. No audio endpoint was activated and no audio was captured.'
     return
 }
 
@@ -1858,12 +2437,17 @@ try {
             [uint32]$targetPid,
             $process.ProcessName,
             -not $ExcludeProcessTree.IsPresent,
-            $audioRing
+            $audioRing,
+            $EnablePipe.IsPresent,
+            $PipeQueuePackets
         )
         [void]$servers.Add($server)
         $server.Start()
         $treeMode = if ($ExcludeProcessTree) { 'target only' } else { 'process tree' }
         Write-Host "Attached local meter to $($process.ProcessName) (PID $targetPid; $treeMode)." -ForegroundColor Green
+        if ($EnablePipe) {
+            Write-Host "RX pipe listening at $($server.PipePath); connect one same-user client for raw PCM." -ForegroundColor Cyan
+        }
     }
 
     if ($DurationSeconds -eq 0) {
@@ -1908,6 +2492,16 @@ catch {
 finally {
     foreach ($server in $servers) {
         $server.Dispose()
+        if ($EnablePipe) {
+            $pipeSummary = "Pipe PID {0}: sent {1} packets ({2:N0} bytes), dropped {3}, no-client {4}, disconnects {5}." -f
+                $server.ProcessId,
+                $server.PipeTransmittedPackets,
+                $server.PipeTransmittedBytes,
+                $server.PipeDroppedPackets,
+                $server.PipeUnconnectedPackets,
+                $server.PipeClientDisconnects
+            Write-Host $pipeSummary
+        }
         if ($server.LastError -and $exitCode -eq 0) {
             $exitCode = 1
             [Console]::Error.WriteLine("error: capture cleanup for PID $($server.ProcessId): $($server.LastError)")
