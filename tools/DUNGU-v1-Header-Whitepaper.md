@@ -117,3 +117,27 @@ audio was listened to.
 References: [repository README](../README.md), [DUNGU implementation](../DUNGU.ps1),
 [Microsoft RIFF services](https://learn.microsoft.com/en-us/windows/win32/multimedia/resource-interchange-file-format-services),
 and [Microsoft RIFF overview](https://learn.microsoft.com/en-us/windows/win32/xaudio2/resource-interchange-file-format--riff-).
+
+## Optional COREO YIN/YAN derived quad file
+
+`Convert-StereoWavToYinYanQuad.ps1` is an optional post-capture transform. It
+does not change DUNGU v1 packets or the named-pipe receiver. It accepts a
+stereo, 16-bit PCM WAVE file and writes a four-channel PCM WAVEFORMATEXTENSIBLE
+file:
+
+| Output channel | Speaker label | Content |
+| ---: | --- | --- |
+| 1 | Front Left | Source left channel in reverse frame order (YIN) |
+| 2 | Front Right | Source right channel in reverse frame order (YIN) |
+| 3 | Back Left | Source left channel in original frame order (YAN) |
+| 4 | Back Right | Source right channel in original frame order (YAN) |
+
+The source is not modified. These four tracks are derived from the same two
+source channels; they do not represent four separately captured inputs. The
+converter labels this in a `LIST/INFO` comment. Its extensible format uses
+channel mask `0x33` (front left, front right, back left, back right). The
+standard channel mask identifies speaker positions and their channel order;
+it does not assert anything about the provenance or independence of the audio.
+
+References: [Microsoft WAVEFORMATEXTENSIBLE](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ksmedia/ns-ksmedia-waveformatextensible)
+and [Microsoft channel-mask guidance](https://learn.microsoft.com/en-us/windows-hardware/drivers/audio/channel-mask).
