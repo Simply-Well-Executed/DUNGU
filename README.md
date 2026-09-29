@@ -1,38 +1,31 @@
 # DUNGU
 
-DUNGU starts with a PowerShell tool backed by embedded C# for auditing Unicode
-bidirectional isolate structure. It treats the supplied atlas as a symbolic
-map, not a translator; graph labels and transform rules remain out of scope
-until their semantics are specified consistently.
+DUNGU is a Windows process-loopback peak meter implemented in PowerShell 7
+with its native audio interop embedded as C# and compiled by `Add-Type`.
+It activates capture only for the process IDs explicitly selected by the
+caller, computes peak levels in memory, and displays local meter bars. It does
+not save, transmit, or play captured audio.
 
-The current audit profile:
-
-- LRI (`U+2066`), RLI (`U+2067`), and FSI (`U+2068`) open isolates.
-- PDI (`U+2069`) closes the most recently opened isolate on the same line.
-- Isolates may not cross a line boundary. CRLF counts as one boundary; CR, LF,
-  NEL (`U+0085`), Line Separator (`U+2028`), and Paragraph Separator
-  (`U+2029`) each end a line.
-- ZWJ (`U+200D`) and ZWNJ (`U+200C`) do not change isolate depth.
-- The audit does not normalize, reorder, or otherwise modify the input. Offsets
-  are zero-based Unicode code points and UTF-8 bytes; line numbers are
-  one-based.
-
-This is a structural check, not a full Unicode Bidirectional Algorithm
-implementation, text renderer, expression parser, or translator.
-
-## Run
+Process loopback requires Windows build 20348 or newer. The meter uses the
+selected process tree by default; pass `-ExcludeProcessTree` to target only the
+specified process. `-DurationSeconds 0` runs until Ctrl+C.
 
 ```powershell
-.\DUNGU.ps1 -Text "⁦text⁩"
-.\DUNGU.ps1 -Text "⁦text⁩" -Json
-Get-Content -Raw -Encoding utf8 .\input.txt | .\DUNGU.ps1
+Get-Process -Name spotify | Select-Object Id, ProcessName
+.\DUNGU.ps1 -ProcessId 1234 -DurationSeconds 20
+.\DUNGU.ps1 -ProcessId 1234,5678 -ExcludeProcessTree
+.\DUNGU.ps1 -CompileOnly
+.\DUNGU.ps1 -SelfTest
 .\tests\DUNGU.Tests.ps1
 ```
 
-Text can be passed as `-Text` or through the PowerShell pipeline (use
-`Get-Content -Raw` to preserve the file's line breaks). With neither, DUNGU
-reads from standard input. It exits with
-status `0` for structurally balanced input, `1` when the report contains
-structural issues, and `2` for invalid Unicode, I/O, or usage errors. The
-embedded C# implementation is compiled by PowerShell at runtime; no external
-package is required.
+The implementation uses the inline process-loopback activation structure,
+correct COM interface IDs, and the system mix format. Peak decoding supports
+PCM 8/16/24/32-bit and IEEE float 32/64-bit formats, including
+`WAVEFORMATEXTENSIBLE`. It rejects unknown layouts rather than treating their
+bytes as floats. Capture and COM objects are owned by a dedicated MTA thread;
+CPU affinity, sample companding, audio queues, file output, and network output
+are intentionally omitted from this meter.
+
+`-SelfTest` validates native layouts and sample decoding without activating an
+audio endpoint or capturing audio.
