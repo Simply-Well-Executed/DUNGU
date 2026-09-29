@@ -477,6 +477,33 @@ namespace Dungu.ProcessLoopback
             }
         }
 
+        internal void ConvertToFloat(byte[] source, int frames, float[] destination, int destinationOffset)
+        {
+            if (source == null)
+                throw new ArgumentNullException("source");
+            if (frames < 0)
+                throw new ArgumentOutOfRangeException("frames");
+            if (destination == null)
+                throw new ArgumentNullException("destination");
+
+            int sampleCount = checked(frames * _channels);
+            int byteCount = checked(frames * _blockAlign);
+            if (source.Length < byteCount)
+                throw new ArgumentException("The source block is shorter than the declared audio frames.", "source");
+            if (destinationOffset < 0 || destinationOffset > destination.Length - sampleCount)
+                throw new ArgumentOutOfRangeException("destinationOffset");
+
+            for (int frame = 0; frame < frames; frame++)
+            {
+                int frameOffset = checked(frame * _blockAlign);
+                for (int channel = 0; channel < _channels; channel++)
+                {
+                    int sampleOffset = checked(frameOffset + channel * _bytesPerSample);
+                    destination[destinationOffset + frame * _channels + channel] = ReadSample(source, sampleOffset);
+                }
+            }
+        }
+
         internal float MeasurePeak(IntPtr data, int frames)
         {
             if (frames < 0)
@@ -657,19 +684,46 @@ namespace Dungu.ProcessLoopback
         public const int HeaderSize = 64;
         public const ushort Version = 1;
 
-        public static void ValidatePayload(AudioTimelineEntry entry, int payloadLength)
+        public static void ValidatePayload(AudioTimelineEntry entry, int payloadLength, AudioStorageMode storageMode)
         {
-            int expectedLength = checked(entry.FrameCount * entry.BlockAlign);
             if (entry.ProcessId <= 0 || entry.SampleRate <= 0 || entry.Channels == 0
                 || entry.BlockAlign == 0 || entry.FrameCount <= 0)
                 throw new ArgumentException("The pipe timeline metadata is incomplete.", "entry");
-            if (payloadLength != expectedLength)
-                throw new ArgumentException("The pipe payload must contain the complete uncompressed audio packet.", "payloadLength");
+            if (payloadLength <= 0)
+                throw new ArgumentOutOfRangeException("payloadLength");
+
+            int decodedLength;
+            switch (storageMode)
+            {
+                case AudioStorageMode.Raw:
+                    decodedLength = checked(entry.FrameCount * entry.BlockAlign);
+                    if (payloadLength != decodedLength || entry.CompandingApplied != 0)
+                        throw new ArgumentException("A raw pipe payload must match the declared audio frames.", "payloadLength");
+                    break;
+                case AudioStorageMode.ZlibRaw:
+                    decodedLength = checked(entry.FrameCount * entry.BlockAlign);
+                    if (payloadLength >= decodedLength || entry.CompandingApplied != 0)
+                        throw new ArgumentException("A ZLIB-raw payload must be smaller than its decoded audio.", "payloadLength");
+                    break;
+                case AudioStorageMode.ZlibCompandedFloat32:
+                    decodedLength = checked(entry.FrameCount * entry.BlockAlign);
+                    if (entry.FormatTag != NativeMethods.WaveFormatIeeeFloat
+                        || entry.BitsPerSample != 32
+                        || entry.ValidBitsPerSample != 32
+                        || entry.BlockAlign != entry.Channels * sizeof(float)
+                        || payloadLength >= decodedLength
+                        || entry.CompandingApplied != 1)
+                        throw new ArgumentException("The companded payload must describe a compressed float32 frame block.", "entry");
+                    break;
+                default:
+                    throw new ArgumentOutOfRangeException("storageMode");
+            }
         }
 
         public static byte[] CreateHeader(AudioTimelineEntry entry, int payloadLength)
         {
-            ValidatePayload(entry, payloadLength);
+            AudioStorageMode storageMode = (AudioStorageMode)entry.StorageMode;
+            ValidatePayload(entry, payloadLength, storageMode);
 
             var header = new byte[HeaderSize];
             header[0] = (byte)'D';
@@ -688,8 +742,8 @@ namespace Dungu.ProcessLoopback
             BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(44, 2), entry.BitsPerSample);
             BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(46, 2), entry.ValidBitsPerSample);
             BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(48, 2), entry.BlockAlign);
-            header[50] = (byte)AudioStorageMode.Raw;
-            header[51] = 0; // The pipe carries the original, uncompanded samples.
+            header[50] = (byte)storageMode;
+            header[51] = entry.CompandingApplied;
             BinaryPrimitives.WriteInt32LittleEndian(header.AsSpan(52, 4), entry.FrameCount);
             BinaryPrimitives.WriteInt32LittleEndian(header.AsSpan(56, 4), payloadLength);
             BinaryPrimitives.WriteInt32LittleEndian(header.AsSpan(60, 4), entry.Flags);
@@ -766,11 +820,13 @@ namespace Dungu.ProcessLoopback
     {
         private const int ConnectionSetupTimeoutSeconds = 5;
         private readonly BoundedAudioPipeQueue _queue;
+        private readonly AudioBlockEncoder _encoder = new AudioBlockEncoder();
         private readonly AutoResetEvent _packetAvailable = new AutoResetEvent(false);
         private readonly CancellationTokenSource _stop = new CancellationTokenSource();
         private readonly TaskCompletionSource<bool> _ready =
             new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         private Thread _worker;
+        private float[] _normalizedScratch = new float[0];
         private NamedPipeServerStream _activePipe;
         private Exception _lastError;
         private int _started;
@@ -845,7 +901,7 @@ namespace Dungu.ProcessLoopback
                 throw new ArgumentNullException("rawAudio");
             if (rawAudio.Length == 0)
                 throw new ArgumentException("Audio pipe packets cannot be empty.", "rawAudio");
-            AudioPipeProtocol.ValidatePayload(timeline, rawAudio.Length);
+            AudioPipeProtocol.ValidatePayload(timeline, rawAudio.Length, AudioStorageMode.Raw);
 
             if (Volatile.Read(ref _disposed) != 0)
                 return false;
@@ -904,11 +960,13 @@ namespace Dungu.ProcessLoopback
                             continue;
                         }
 
-                        byte[] header = AudioPipeProtocol.CreateHeader(packet.Timeline, packet.Payload.Length);
+                        AudioTimelineEntry wireTimeline;
+                        EncodedAudioBlock encoded = EncodePacket(packet, out wireTimeline);
+                        byte[] header = AudioPipeProtocol.CreateHeader(wireTimeline, encoded.Payload.Length);
                         try
                         {
                             pipe.WriteAsync(header, 0, header.Length, _stop.Token).GetAwaiter().GetResult();
-                            pipe.WriteAsync(packet.Payload, 0, packet.Payload.Length, _stop.Token).GetAwaiter().GetResult();
+                            pipe.WriteAsync(encoded.Payload, 0, encoded.Payload.Length, _stop.Token).GetAwaiter().GetResult();
                         }
                         catch (IOException) when (!_stop.IsCancellationRequested)
                         {
@@ -916,7 +974,7 @@ namespace Dungu.ProcessLoopback
                             throw;
                         }
                         Interlocked.Increment(ref _transmittedPackets);
-                        Interlocked.Add(ref _transmittedBytes, packet.Payload.Length);
+                        Interlocked.Add(ref _transmittedBytes, encoded.Payload.Length);
                     }
                 }
                 catch (OperationCanceledException) when (_stop.IsCancellationRequested)
@@ -953,6 +1011,34 @@ namespace Dungu.ProcessLoopback
             int discardedCount = _queue.Clear();
             if (discardedCount > 0)
                 Interlocked.Add(ref _droppedPackets, discardedCount);
+        }
+
+        private EncodedAudioBlock EncodePacket(AudioPipePacket packet, out AudioTimelineEntry wireTimeline)
+        {
+            AudioTimelineEntry sourceTimeline = packet.Timeline;
+            AudioSampleFormat format = AudioSampleFormat.FromTimeline(sourceTimeline);
+            int sampleCount = checked(sourceTimeline.FrameCount * sourceTimeline.Channels);
+            if (_normalizedScratch.Length < sampleCount)
+                _normalizedScratch = new float[sampleCount];
+            format.ConvertToFloat(packet.Payload, sourceTimeline.FrameCount, _normalizedScratch, 0);
+
+            EncodedAudioBlock encoded = _encoder.Encode(
+                packet.Payload,
+                packet.Payload.Length,
+                _normalizedScratch,
+                sampleCount);
+
+            wireTimeline = sourceTimeline;
+            wireTimeline.StorageMode = (byte)encoded.StorageMode;
+            wireTimeline.CompandingApplied = encoded.CompandingApplied ? (byte)1 : (byte)0;
+            if (encoded.StorageMode == AudioStorageMode.ZlibCompandedFloat32)
+            {
+                wireTimeline.FormatTag = NativeMethods.WaveFormatIeeeFloat;
+                wireTimeline.BitsPerSample = sizeof(float) * 8;
+                wireTimeline.ValidBitsPerSample = sizeof(float) * 8;
+                wireTimeline.BlockAlign = checked((ushort)(wireTimeline.Channels * sizeof(float)));
+            }
+            return encoded;
         }
     }
 
@@ -1909,6 +1995,8 @@ namespace Dungu.ProcessLoopback
             passed.Add("ZLIB framing, DEFLATE payload, and Adler-32 validation");
             VerifyAdaptiveEncoding();
             passed.Add("companding/ZLIB selection with a raw fallback that never expands blocks");
+            VerifyPipeCompandedHeader();
+            passed.Add("companded float32 pipe-frame metadata and bounded compressed payload");
             VerifyCompanding();
             passed.Add("4-D hysteresis companding and bounded inverse error");
             VerifyTimelineReplay();
@@ -2322,9 +2410,85 @@ namespace Dungu.ProcessLoopback
                         throw new InvalidOperationException("The named-pipe transport changed audio bytes.");
                 }
 
-                if (broadcaster.TransmittedPackets != 1 || broadcaster.TransmittedBytes != sourceBytes.Length)
+                byte[] silence = new byte[512];
+                var silenceEntry = new AudioTimelineEntry
+                {
+                    Sequence = 10,
+                    QpcPosition = 123456900,
+                    DevicePosition = 48003,
+                    ProcessId = 42,
+                    FrameCount = 128,
+                    Flags = NativeMethods.AudioClientBufferFlagSilent,
+                    SampleRate = 44100,
+                    Channels = 2,
+                    BlockAlign = 4,
+                    FormatTag = NativeMethods.WaveFormatPcm,
+                    BitsPerSample = 16,
+                    ValidBitsPerSample = 16
+                };
+                if (!broadcaster.TryPublish(silence, silenceEntry))
+                    throw new InvalidOperationException("The named-pipe server rejected a silent packet.");
+
+                byte[] compressedHeader = new byte[AudioPipeProtocol.HeaderSize];
+                ReadExactly(client, compressedHeader);
+                int compressedLength = BinaryPrimitives.ReadInt32LittleEndian(compressedHeader.AsSpan(56, 4));
+                if (compressedHeader[50] != (byte)AudioStorageMode.ZlibRaw
+                    || compressedHeader[51] != 0
+                    || compressedLength <= 0
+                    || compressedLength >= silence.Length)
+                    throw new InvalidOperationException("The pipe did not select its smaller lossless ZLIB representation.");
+                byte[] compressedSilence = new byte[compressedLength];
+                ReadExactly(client, compressedSilence);
+                byte[] expandedSilence = ZlibCodec.Decompress(compressedSilence, 0, compressedLength, silence.Length);
+                for (int index = 0; index < expandedSilence.Length; index++)
+                {
+                    if (expandedSilence[index] != 0)
+                        throw new InvalidOperationException("The pipe's ZLIB audio payload did not round-trip.");
+                }
+
+                if (broadcaster.TransmittedPackets != 2
+                    || broadcaster.TransmittedBytes != sourceBytes.Length + compressedLength)
                     throw new InvalidOperationException("The named-pipe transport did not account for its packet.");
             }
+        }
+
+        private static void VerifyPipeCompandedHeader()
+        {
+            const int SampleCount = 1024;
+            byte[] noisySource = new byte[SampleCount * sizeof(double)];
+            new Random(7).NextBytes(noisySource);
+            var highAmplitude = new float[SampleCount];
+            for (int index = 0; index < highAmplitude.Length; index++)
+                highAmplitude[index] = (index & 1) == 0 ? 0.9f : -0.9f;
+
+            EncodedAudioBlock encoded = new AudioBlockEncoder().Encode(
+                noisySource,
+                noisySource.Length,
+                highAmplitude,
+                highAmplitude.Length);
+            if (encoded.StorageMode != AudioStorageMode.ZlibCompandedFloat32 || !encoded.CompandingApplied)
+                throw new InvalidOperationException("The encoder did not select a smaller, error-bounded 4-D companded block.");
+
+            var timeline = new AudioTimelineEntry
+            {
+                Sequence = 4,
+                ProcessId = 42,
+                FrameCount = SampleCount,
+                SampleRate = 44100,
+                Channels = 1,
+                BlockAlign = sizeof(float),
+                FormatTag = NativeMethods.WaveFormatIeeeFloat,
+                BitsPerSample = sizeof(float) * 8,
+                ValidBitsPerSample = sizeof(float) * 8,
+                StorageMode = (byte)encoded.StorageMode,
+                CompandingApplied = 1
+            };
+            byte[] header = AudioPipeProtocol.CreateHeader(timeline, encoded.Payload.Length);
+            if (header[50] != (byte)AudioStorageMode.ZlibCompandedFloat32 || header[51] != 1
+                || BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(42, 2)) != NativeMethods.WaveFormatIeeeFloat
+                || BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(44, 2)) != sizeof(float) * 8
+                || BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(48, 2)) != sizeof(float))
+                throw new InvalidOperationException("The companded pipe header does not describe its float32 payload.");
         }
 
         private static void VerifyBoundedPipeQueue()

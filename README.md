@@ -4,7 +4,7 @@ DUNGU is a Windows process-loopback peak meter implemented in PowerShell 7
 with its native audio interop embedded as C# and compiled by `Add-Type`.
 It activates capture only for the process IDs explicitly selected by the
 caller, computes peak levels in memory, and displays local meter bars. It does
-not save or play captured audio; optional `-EnablePipe` sends raw packets only
+not save or play captured audio; optional `-EnablePipe` streams packets only
 to a same-user local named-pipe client.
 
 Process loopback requires Windows build 20348 or newer. The meter uses the
@@ -59,14 +59,17 @@ layouts. Capture and COM objects are owned by a dedicated MTA thread.
 `-EnablePipe` starts one local named-pipe server per PID at
 `\\.\pipe\DunguAudioPipe_<pid>`. The server accepts one same-user client at a
 time. The named pipe only exists while the script is running. Its dedicated
-worker writes uncompressed source-format audio packets; the capture thread
-only enqueues into the bounded `-PipeQueuePackets` queue (default 1; increase
-it if scheduling jitter causes drops). When that queue fills, the oldest
-pending packet is dropped to keep the stream near live rather than stalling
-capture. Packets arriving before a client connects are not retained for later
-delivery. The pipe ACL permits the current user and LocalSystem, and the native
-pipe rejects remote clients. Pipe connections and streams are disposed when
-the script exits.
+worker writes packets; the capture thread only enqueues source bytes into the
+bounded `-PipeQueuePackets` queue (default 1; increase it if scheduling jitter
+causes drops). The worker tries lossless ZLIB and uses it only when it saves
+space; it may also use the `sign(x) * sqrt(abs(x))` companded float32 form when
+the inverse error is at most `1e-5` and the compressed result beats the
+lossless/raw candidate. Otherwise it sends the original bytes. When the queue
+fills, the oldest pending packet is dropped to keep the stream near live
+rather than stalling capture. Packets arriving before a client connects are
+not retained for later delivery. The pipe ACL permits the current user and
+LocalSystem, and the native pipe rejects remote clients. Pipe connections and
+streams are disposed when the script exits.
 
 The pipe is IPC, **not a Windows audio input device**. It does not dynamically
 install or create an endpoint visible to other audio applications. To expose
@@ -82,8 +85,13 @@ transport buffer internally even when DUNGU's bounded queue is set to one.
 
 The pipe is a byte stream, so clients must read exactly the 64-byte header
 before reading that frame's `payloadLength` bytes; a pipe write is not a
-message boundary. All integers are little-endian. The payload is original,
-uncompanded audio in the capture format.
+message boundary. All integers are little-endian. The payload encoding field
+determines how to decode each packet: `0` is raw source-format bytes; `1` is
+ZLIB-compressed source-format bytes; `2` is ZLIB-compressed companded float32.
+For encoding `2`, the format fields describe the float32 payload and a client
+can approximate the original with `sign(x) * x * x` when the companding flag is
+set. The per-process sequence may have gaps when packets arrive before a client
+connects or the bounded queue drops stale packets.
 
 | Offset | Size | Field |
 | --- | ---: | --- |
@@ -100,8 +108,8 @@ uncompanded audio in the capture format.
 | 44 | 2 | Container bits per sample |
 | 46 | 2 | Valid bits per sample |
 | 48 | 2 | Block alignment |
-| 50 | 1 | Payload encoding (`0` raw) |
-| 51 | 1 | Companding flag (`0` for raw pipe audio) |
+| 50 | 1 | Payload encoding (`0` raw, `1` ZLIB raw, `2` ZLIB companded float32) |
+| 51 | 1 | Companding applied (`0` no, `1` yes) |
 | 52 | 4 | Frame count |
 | 56 | 4 | Payload byte length |
 | 60 | 4 | WASAPI capture flags |
