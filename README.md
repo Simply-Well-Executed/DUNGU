@@ -117,3 +117,58 @@ connects or the bounded queue drops stale packets.
 `-SelfTest` validates native layouts, ZLIB framing/checksums, bounded companding
 error, ring/timeline alignment, repeatable reads, and a local named-pipe
 round-trip without activating an audio endpoint or capturing audio.
+
+## One-command quad to float WAV conversion
+
+`tools/Convert-AnythingToCoreoFloat.ps1` is an offline, post-capture converter.
+It directly accepts mono or stereo RIFF/WAVE containing PCM 8/16/24/32-bit or
+IEEE-float 32/64-bit samples. Other inputs are decoded from their first audio
+stream by FFmpeg found on `PATH` or passed through `-FfmpegPath`, then staged as
+temporary stereo IEEE-float32 WAV. Multichannel sources are downmixed to stereo
+by FFmpeg; exact format support depends on the installed FFmpeg build. RF64 or
+very long sources may exceed the classic RIFF size limit. Extensible stereo
+WAVs are read directly only with the conventional front-left/front-right mask
+(`0x3`) or an unspecified mask (`0`).
+
+The converter first builds and validates a four-channel intermediate. Channel
+1 is YIN (left input in reverse frame order), channel 2 is YIN (right input in
+reverse frame order), channel 3 is YAN (left input in forward frame order), and
+channel 4 is YAN (right input in forward frame order). Mono input is duplicated
+into each left/right pair. It then writes a four-channel IEEE-float32 WAVE with
+the same sample rate and frame order, preserving channel order and multiplying
+each sample by `-1` exactly once. This is polarity inversion; it does not rotate
+or spatialize sound by itself. The final channel mask is `0x33` (front left,
+front right, back left, back right).
+
+```powershell
+pwsh -NoProfile -File .\tools\Convert-AnythingToCoreoFloat.ps1 `
+  -SourcePath .\capture.wav `
+  -OutputPath .\capture-coreo-float.wav
+
+# Keep a separate validated quad intermediate as well:
+pwsh -NoProfile -File .\tools\Convert-AnythingToCoreoFloat.ps1 `
+  -SourcePath .\capture.wav `
+  -OutputPath .\capture-coreo-float.wav `
+  -QuadOutputPath .\capture-quad.wav
+
+# Decode a compressed source via FFmpeg (automatic when ffmpeg is on PATH):
+pwsh -NoProfile -File .\tools\Convert-AnythingToCoreoFloat.ps1 `
+  -SourcePath .\song.flac `
+  -OutputPath .\song-coreo-float.wav `
+  -FfmpegPath C:\FFmpeg\bin\ffmpeg.exe
+```
+
+By default, the intermediate exists only during conversion and is removed once
+the final file passes its RIFF, format, frame-count, channel-mask, and finite
+sample checks. The final file contains four float32 samples per frame (16 data
+bytes/frame); this is a format conversion, not a compression scheme, and may be
+larger than the source. The disk-space saving is that the intermediate quad is
+not retained unless `-QuadOutputPath` is supplied. Existing destination files
+are never overwritten.
+
+The finalization thread asks Windows for the active processor-group mask, tries
+the highest active logical processor in the current group first, and restores
+its original affinity and managed priority afterward. This pins a thread; it
+does not park a CPU core, reserve a “cryptography core,” or prevent interrupts.
+The converter validates a temporary output before publishing it. It operates on
+files only and does not route sound into this chat.

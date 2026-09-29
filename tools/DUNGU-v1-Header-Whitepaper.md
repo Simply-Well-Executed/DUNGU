@@ -141,3 +141,61 @@ it does not assert anything about the provenance or independence of the audio.
 
 References: [Microsoft WAVEFORMATEXTENSIBLE](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ksmedia/ns-ksmedia-waveformatextensible)
 and [Microsoft channel-mask guidance](https://learn.microsoft.com/en-us/windows-hardware/drivers/audio/channel-mask).
+
+## One-command validated quad to float32 conversion
+
+`Convert-AnythingToCoreoFloat.ps1` combines source decoding, quad construction,
+validation, and final IEEE-float32 writing. It directly accepts mono/stereo
+classic RIFF/WAVE with uncompressed PCM 8/16/24/32-bit or IEEE-float 32/64-bit
+samples. Other inputs are decoded from their first audio stream by FFmpeg from
+`PATH` or `-FfmpegPath`, then staged as temporary stereo IEEE-float32 WAVE.
+Multichannel sources are downmixed to stereo by FFmpeg; exact codec support
+depends on the installed FFmpeg build. RF64 or very long sources may exceed
+classic RIFF's size limit. Extensible stereo WAVE is read directly only with
+the conventional front-left/front-right channel mask (`0x3`) or an unspecified
+mask (`0`). The source remains untouched and existing destinations are never
+overwritten.
+
+The intermediate channel map follows the established quad transform:
+
+| Quad channel | Content |
+| ---: | --- |
+| 1 | YIN: source left in reverse frame order; mono is duplicated |
+| 2 | YIN: source right in reverse frame order; mono is duplicated |
+| 3 | YAN: source left in forward frame order; mono is duplicated |
+| 4 | YAN: source right in forward frame order; mono is duplicated |
+
+The script reopens that intermediate and validates RIFF boundaries, format,
+channel mask, sample rate, frame count, and representable finite sample values.
+Only after that check does it write a four-channel IEEE-float32 file. Final
+channels and frame order are preserved, and every sample is multiplied by `-1`
+once. This operation reverses sample polarity. It is not a geometric rotation,
+spatial renderer, or proof of four-dimensional acoustic output. The resulting
+file is four-channel audio data with speaker mask `0x33`.
+
+The final file contains 16 audio-data bytes per frame. It is not compressed and
+may take more space than the source. Omitting `-QuadOutputPath` makes the quad
+intermediate temporary and removes it after successful validation, avoiding a
+second retained copy. Passing `-QuadOutputPath` retains that validated
+intermediate for inspection or reuse. The final output is also written to a
+temporary path, reopened and validated, then moved into place.
+
+The finalization worker queries Windows' active processor-group mask and tries
+the highest active logical processor in its current group first. If Windows
+rejects that affinity, it tries the next lower active processor. It raises the
+managed thread priority to `Highest` for the conversion and restores the
+previous priority and affinity afterward. Processor affinity binds the thread;
+it does not park a CPU, identify a dedicated cryptography core, or suppress
+system interrupts. Run it in 64-bit PowerShell because the active affinity mask
+is pointer-sized.
+
+The affinity query uses `GetLogicalProcessorInformationEx(RelationGroup)` to
+read each group's active mask; the pin and restore use `SetThreadGroupAffinity`.
+These APIs report and set processor affinity, not whether a core is idle or can
+be power-parked. See Microsoft's [processor-group query](https://learn.microsoft.com/en-us/windows/desktop/api/sysinfoapi/nf-sysinfoapi-getlogicalprocessorinformationex),
+[group layout](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-group_relationship),
+and [thread-affinity API](https://learn.microsoft.com/en-us/windows/win32/api/processtopologyapi/nf-processtopologyapi-setthreadgroupaffinity).
+
+The script is a local file-conversion tool. It does not connect to the DUNGU
+named pipe, create a Windows audio device, or supply audio to this chat. See the
+[repository workflow and examples](../README.md#one-command-quad-to-float-wav-conversion).
