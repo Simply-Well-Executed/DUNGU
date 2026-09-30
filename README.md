@@ -140,6 +140,52 @@ each sample by `-1` exactly once. This is polarity inversion; it does not rotate
 or spatialize sound by itself. The final channel mask is `0x33` (front left,
 front right, back left, back right).
 
+## Binary stdin/stdout stream mode
+
+`-StdinStdout` is a separate, headerless stream interface. It reads interleaved
+stereo IEEE-float32 little-endian samples from stdin and writes interleaved
+four-channel IEEE-float32 little-endian samples to stdout. It does not read or
+write WAVE headers or add custom chunks. Use FFmpeg at the pipe boundaries to
+decode any supported audio source and, if desired, wrap the result in an
+ordinary WAVE file:
+
+```powershell
+ffmpeg -hide_banner -i .\source.flac -map 0:a:0 -vn -ac 2 -ar 48000 `
+  -c:a pcm_f32le -f f32le pipe:1 |
+  pwsh -NoProfile -File .\tools\Convert-AnythingToCoreoFloat.ps1 `
+    -StdinStdout -FramesPerBlock 16384 |
+  ffmpeg -hide_banner -f f32le -ar 48000 -ac 4 -channel_layout quad `
+    -i pipe:0 -c:a pcm_f32le -f wav .\source-coreo.wav
+```
+
+Use PowerShell 7.4 or newer for byte-preserving native-command pipelines.
+The converter itself writes directly to the process' binary stdin/stdout
+handles; it does not send audio samples through PowerShell's object pipeline.
+
+The output channel order matches the file converter: channel 1 is inverted
+left YIN (entire input in reverse frame order), channel 2 inverted right YIN,
+channel 3 inverted left YAN (forward), and channel 4 inverted right YAN
+(forward). Mono/stereo conversion and source decoding happen in the FFmpeg
+input command; for headerless input, put its `-f`, `-ar`, and `-ac` options
+before FFmpeg's `-i`.
+
+Exact whole-stream YIN reversal requires knowing the final frame count. The
+tool therefore spools decoded stereo float32 samples to a temporary raw scratch
+file, validates the complete input, then writes the transformed samples to
+stdout. No output is produced until stdin reaches EOF, so this mode is a
+finite-stream pipeline, not a zero-buffer live-audio processor. The scratch
+file is deleted when processing ends. `-FramesPerBlock` controls working
+memory only; changing it does not change the output ordering. The output is
+raw audio with no sample-rate header, so the FFmpeg output command must use the
+same rate selected by the input command.
+
+Run the stream checks (no FFmpeg required):
+
+```powershell
+pwsh -NoProfile -File .\tools\Convert-AnythingToCoreoFloat.ps1 -StreamSelfTest
+pwsh -NoProfile -File .\tests\Convert-AnythingToCoreoFloat.Tests.ps1
+```
+
 ```powershell
 pwsh -NoProfile -File .\tools\Convert-AnythingToCoreoFloat.ps1 `
   -SourcePath .\capture.wav `

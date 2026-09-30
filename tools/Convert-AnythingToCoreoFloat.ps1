@@ -1,23 +1,36 @@
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'Files')]
 param(
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'Files')]
     [ValidateNotNullOrEmpty()]
     [string] $SourcePath,
 
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'Files')]
     [ValidateNotNullOrEmpty()]
     [string] $OutputPath,
 
+    [Parameter(ParameterSetName = 'Files')]
     [ValidateNotNullOrEmpty()]
     [string] $Title = 'COREO YIN reverse - YAN forward',
 
     # Optional: keep the validated four-channel intermediate at this path.
     # If omitted, the intermediate is temporary and is removed after finalization.
+    [Parameter(ParameterSetName = 'Files')]
     [string] $QuadOutputPath,
 
     # Optional FFmpeg executable for compressed/non-WAVE inputs or layouts
     # that need normalization to a stereo working stream.
-    [string] $FfmpegPath
+    [Parameter(ParameterSetName = 'Files')]
+    [string] $FfmpegPath,
+
+    [Parameter(Mandatory = $true, ParameterSetName = 'StdinStdout')]
+    [switch] $StdinStdout,
+
+    [Parameter(ParameterSetName = 'StdinStdout')]
+    [ValidateRange(1, 1048576)]
+    [int] $FramesPerBlock = 16384,
+
+    [Parameter(Mandatory = $true, ParameterSetName = 'StreamSelfTest')]
+    [switch] $StreamSelfTest
 )
 
 # One-command post-capture pathway:
@@ -35,6 +48,10 @@ param(
 # binaural rendering. Stage 2 is pinned to the highest active logical
 # processor number in the current Windows processor group, at Highest managed
 # thread priority. Windows does not assign a special cryptography core.
+#
+# -StdinStdout is a separate raw-stream mode: stereo float32 little-endian in,
+# four-channel float32 little-endian out. It uses a temporary scratch stream
+# because the attached mapping reverses YIN over the complete finite input.
 
 $csharpCode = @'
 using System;
@@ -293,6 +310,228 @@ public static class AnythingToCoreoFloatPipeline
             }
         }
 
+    }
+
+    public static long RunStdinStdout(int framesPerBlock)
+    {
+        return TransformStereoFloat32(
+            Console.OpenStandardInput(),
+            Console.OpenStandardOutput(),
+            framesPerBlock);
+    }
+
+    public static long TransformStereoFloat32(Stream input, Stream output, int framesPerBlock)
+    {
+        if (input == null)
+            throw new ArgumentNullException("input");
+        if (output == null)
+            throw new ArgumentNullException("output");
+        if (!input.CanRead)
+            throw new ArgumentException("The input stream must be readable.", "input");
+        if (!output.CanWrite)
+            throw new ArgumentException("The output stream must be writable.", "output");
+        if (framesPerBlock <= 0)
+            throw new ArgumentOutOfRangeException("framesPerBlock");
+
+        using (FileStream decoded = CreateTemporaryFloatSpool())
+        {
+            CopyStream(input, decoded);
+            decoded.Flush();
+            decoded.Position = 0;
+            return TransformSeekableStereoFloat32(decoded, output, framesPerBlock);
+        }
+    }
+
+    public static string[] RunStreamSelfTests()
+    {
+        float[] sourceSamples = new float[]
+        {
+            1.0f, 10.0f,
+            2.0f, 20.0f,
+            3.0f, 30.0f
+        };
+        float[] expectedSamples = new float[]
+        {
+            -3.0f, -30.0f, -1.0f, -10.0f,
+            -2.0f, -20.0f, -2.0f, -20.0f,
+            -1.0f, -10.0f, -3.0f, -30.0f
+        };
+        byte[] sourceBytes = new byte[sourceSamples.Length * sizeof(float)];
+        Buffer.BlockCopy(sourceSamples, 0, sourceBytes, 0, sourceBytes.Length);
+        var output = new MemoryStream();
+        long frameCount;
+        using (var input = new MemoryStream(sourceBytes, false))
+            frameCount = TransformStereoFloat32(input, output, 2);
+
+        if (frameCount != 3 || output.Length != expectedSamples.Length * sizeof(float))
+            throw new InvalidOperationException("The stream transform returned an unexpected frame or byte count.");
+        byte[] outputBytes = output.ToArray();
+        for (int index = 0; index < expectedSamples.Length; index++)
+        {
+            float actual = BitConverter.ToSingle(outputBytes, index * sizeof(float));
+            if (Math.Abs(actual - expectedSamples[index]) > 0.000001f)
+                throw new InvalidOperationException("The stream transform changed the required COREO sample order.");
+        }
+
+        var blockSizeOne = new MemoryStream();
+        using (var input = new MemoryStream(sourceBytes, false))
+            TransformStereoFloat32(input, blockSizeOne, 1);
+        if (!BytesEqual(outputBytes, blockSizeOne.ToArray()))
+            throw new InvalidOperationException("The full-stream reverse changed with the processing block size.");
+
+        var emptyOutput = new MemoryStream();
+        using (var emptyInput = new MemoryStream())
+        {
+            if (TransformStereoFloat32(emptyInput, emptyOutput, 2) != 0 || emptyOutput.Length != 0)
+                throw new InvalidOperationException("An empty input stream must produce an empty output stream.");
+        }
+
+        var partialOutput = new MemoryStream();
+        bool partialFrameRejected = false;
+        try
+        {
+            using (var partialInput = new MemoryStream(new byte[7], false))
+                TransformStereoFloat32(partialInput, partialOutput, 2);
+        }
+        catch (InvalidDataException)
+        {
+            partialFrameRejected = true;
+        }
+        if (!partialFrameRejected || partialOutput.Length != 0)
+            throw new InvalidOperationException("A partial stereo float32 frame must fail before writing stdout.");
+
+        var nonFiniteOutput = new MemoryStream();
+        float[] nonFiniteSamples = new float[] { Single.NaN, 0.0f };
+        byte[] nonFiniteBytes = new byte[nonFiniteSamples.Length * sizeof(float)];
+        Buffer.BlockCopy(nonFiniteSamples, 0, nonFiniteBytes, 0, nonFiniteBytes.Length);
+        bool nonFiniteRejected = false;
+        try
+        {
+            using (var nonFiniteInput = new MemoryStream(nonFiniteBytes, false))
+                TransformStereoFloat32(nonFiniteInput, nonFiniteOutput, 2);
+        }
+        catch (InvalidDataException)
+        {
+            nonFiniteRejected = true;
+        }
+        if (!nonFiniteRejected || nonFiniteOutput.Length != 0)
+            throw new InvalidOperationException("Non-finite samples must fail before writing stdout.");
+
+        return new string[]
+        {
+            "exact whole-stream YIN reverse and YAN forward sample order",
+            "polarity inversion and four-channel float32 output",
+            "block-size-independent output ordering",
+            "empty-stream handling and pre-output validation"
+        };
+    }
+
+    private static long TransformSeekableStereoFloat32(Stream input, Stream output, int framesPerBlock)
+    {
+        if (input == null || !input.CanRead || !input.CanSeek)
+            throw new ArgumentException("The decoded stereo float32 stream must be readable and seekable.", "input");
+        if (output == null || !output.CanWrite)
+            throw new ArgumentException("The output stream must be writable.", "output");
+        if (framesPerBlock <= 0)
+            throw new ArgumentOutOfRangeException("framesPerBlock");
+        if (!BitConverter.IsLittleEndian)
+            throw new PlatformNotSupportedException("The raw float32 stream requires little-endian byte order.");
+
+        const int InputBlockAlign = 2 * sizeof(float);
+        const int OutputChannels = 4;
+        long decodedLength = input.Length;
+        if (decodedLength % InputBlockAlign != 0)
+            throw new InvalidDataException("FFmpeg produced a partial stereo float32 frame.");
+
+        long totalFrames = decodedLength / InputBlockAlign;
+        byte[] validationBuffer = new byte[65536 - (65536 % sizeof(float))];
+        input.Position = 0;
+        long remainingBytes = decodedLength;
+        while (remainingBytes > 0)
+        {
+            int count = (int)Math.Min(validationBuffer.Length, remainingBytes);
+            count -= count % sizeof(float);
+            ReadExactly(input, validationBuffer, count);
+            for (int offset = 0; offset < count; offset += sizeof(float))
+            {
+                float sample = BitConverter.ToSingle(validationBuffer, offset);
+                if (!IsFinite(sample))
+                    throw new InvalidDataException("The decoded input contains a non-finite float32 sample.");
+            }
+            remainingBytes -= count;
+        }
+
+        byte[] reverseInput = new byte[checked(framesPerBlock * InputBlockAlign)];
+        byte[] forwardInput = new byte[checked(framesPerBlock * InputBlockAlign)];
+        float[] outputSamples = new float[checked(framesPerBlock * OutputChannels)];
+        byte[] outputBytes = new byte[checked(framesPerBlock * OutputChannels * sizeof(float))];
+        long outputFrame = 0;
+
+        while (outputFrame < totalFrames)
+        {
+            int blockFrames = (int)Math.Min(framesPerBlock, totalFrames - outputFrame);
+            int inputBytes = checked(blockFrames * InputBlockAlign);
+            long reverseStartFrame = totalFrames - outputFrame - blockFrames;
+
+            input.Position = checked(reverseStartFrame * InputBlockAlign);
+            ReadExactly(input, reverseInput, inputBytes);
+            input.Position = checked(outputFrame * InputBlockAlign);
+            ReadExactly(input, forwardInput, inputBytes);
+
+            for (int frame = 0; frame < blockFrames; frame++)
+            {
+                int reverseOffset = (blockFrames - 1 - frame) * InputBlockAlign;
+                int forwardOffset = frame * InputBlockAlign;
+                int outputOffset = frame * OutputChannels;
+
+                outputSamples[outputOffset] = -BitConverter.ToSingle(reverseInput, reverseOffset);
+                outputSamples[outputOffset + 1] = -BitConverter.ToSingle(reverseInput, reverseOffset + sizeof(float));
+                outputSamples[outputOffset + 2] = -BitConverter.ToSingle(forwardInput, forwardOffset);
+                outputSamples[outputOffset + 3] = -BitConverter.ToSingle(forwardInput, forwardOffset + sizeof(float));
+            }
+
+            int sampleCount = checked(blockFrames * OutputChannels);
+            int outputByteCount = checked(sampleCount * sizeof(float));
+            Buffer.BlockCopy(outputSamples, 0, outputBytes, 0, outputByteCount);
+            output.Write(outputBytes, 0, outputByteCount);
+            outputFrame += blockFrames;
+        }
+
+        output.Flush();
+        return totalFrames;
+    }
+
+    private static FileStream CreateTemporaryFloatSpool()
+    {
+        string tempPath = Path.Combine(Path.GetTempPath(), "dungu-coreo-" + Guid.NewGuid().ToString("N") + ".f32");
+        return new FileStream(
+            tempPath,
+            FileMode.CreateNew,
+            FileAccess.ReadWrite,
+            FileShare.None,
+            65536,
+            FileOptions.DeleteOnClose);
+    }
+
+    private static void CopyStream(Stream input, Stream output)
+    {
+        byte[] buffer = new byte[65536];
+        int read;
+        while ((read = input.Read(buffer, 0, buffer.Length)) != 0)
+            output.Write(buffer, 0, read);
+        output.Flush();
+    }
+
+    private static bool BytesEqual(byte[] first, byte[] second)
+    {
+        if (first.Length != second.Length)
+            return false;
+        for (int index = 0; index < first.Length; index++)
+        {
+            if (first[index] != second[index])
+                return false;
+        }
+        return true;
     }
 
     public static AnythingToCoreoFloatReport Convert(
@@ -947,6 +1186,29 @@ public static class AnythingToCoreoFloatPipeline
 
 if ($null -eq ('AnythingToCoreoFloatPipeline' -as [type])) {
     Add-Type -TypeDefinition $csharpCode -ErrorAction Stop
+}
+
+if ($PSCmdlet.ParameterSetName -eq 'StreamSelfTest') {
+    foreach ($check in [AnythingToCoreoFloatPipeline]::RunStreamSelfTests()) {
+        Write-Output "PASS $check"
+    }
+    Write-Output 'All stdin/stdout transform tests passed.'
+    return
+}
+
+if ($PSCmdlet.ParameterSetName -eq 'StdinStdout') {
+    try {
+        $frameCount = [AnythingToCoreoFloatPipeline]::RunStdinStdout($FramesPerBlock)
+        [Console]::Error.WriteLine(
+            "COREO stream complete: $frameCount stereo float32 frames transformed to raw 4-channel float32 stdout."
+        )
+        return
+    }
+    catch {
+        $errorToReport = $_.Exception.GetBaseException()
+        [Console]::Error.WriteLine("error: $($errorToReport.Message)")
+        exit 1
+    }
 }
 
 $originalSourcePath = [IO.Path]::GetFullPath($SourcePath)
